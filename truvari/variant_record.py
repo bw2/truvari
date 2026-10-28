@@ -635,9 +635,16 @@ class VariantRecord:
             >>> b = next(v)
             >>> a.recovl(b)
             0
+
+        With --dup-to-ins, a resolved DUP's end is set to start + 1 (see `resolve`), so its
+        original interval (start to the record's END) is used instead.
         """
         astart, aend = self.boundaries(ins_inflate)
         bstart, bend = other.boundaries(ins_inflate)
+        if self.params.dup_to_ins and self.var_type() == truvari.SV.DUP:
+            aend = self._record.stop
+        if other.params.dup_to_ins and other.var_type() == truvari.SV.DUP:
+            bend = other._record.stop
         return truvari.reciprocal_overlap(astart, aend, bstart, bend)
 
     def resolve(self, ref):
