@@ -7,10 +7,12 @@ import unittest
 
 from collections import defaultdict
 from intervaltree import IntervalTree
+import pysam
 
 # Use the current truvari, not any installed libraries
 sys.path.insert(0, os.getcwd())
 import truvari
+import truvari.collapse
 from truvari import phab
 from truvari.region_vcf_iter import region_filter_stream, region_filter_fetch
 
@@ -160,6 +162,135 @@ class TestPhab(unittest.TestCase):
         job = phab.PhabJob("fake", mem_vcf_info)
         self.assertTrue(phab.status_marker(1, {}, "", job) == "ERROR: 'str' object is not callable", "PhabJob")
         phab.cleanup_shared_memory(shared_info)
+
+
+TEST_VCF_HEADER = """##fileformat=VCFv4.2
+##contig=<ID=chr20,length=1000000>
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
+##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="Length of structural variant">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+"""
+TEST_REFERENCE = "repo_utils/test_files/references/reference.fa"
+
+
+def write_indexed_vcf(records, samples):
+    """
+    Write records (lists of the VCF columns, from CHROM to the samples' GT) under TEST_VCF_HEADER
+    to a bgzipped, indexed temporary VCF and return its path
+    """
+    fn = truvari.make_temp_filename(suffix=".vcf")
+    with open(fn, 'w') as fout:
+        fout.write(TEST_VCF_HEADER)
+        fout.write("\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"]
+                             + samples) + "\n")
+        for record in records:
+            fout.write("\t".join(str(column) for column in record) + "\n")
+    return pysam.tabix_index(fn, preset="vcf", force=True)
+
+
+def run_collapse(input_vcf, *options):
+    """
+    Run truvari collapse on input_vcf and return (kept record IDs, collapsed record IDs)
+    """
+    kept_fn = truvari.make_temp_filename(suffix=".vcf")
+    collapsed_fn = truvari.make_temp_filename(suffix=".vcf")
+    truvari.collapse.collapse_main(["-i", input_vcf, "-o", kept_fn, "-c", collapsed_fn, *options])
+    with pysam.VariantFile(kept_fn) as kept, pysam.VariantFile(collapsed_fn) as collapsed:
+        return [r.id for r in kept], [r.id for r in collapsed]
+
+
+class TestCollapseBndSizeSubChunking(unittest.TestCase):
+    """
+    collapse sub-chunks chunks of 100+ variants by size. BNDs all have size 0, so they must be kept
+    in one sub-chunk; otherwise each is alone and none are collapsed.
+    """
+    N_BNDS = 110
+
+    def make_vcf(self, n_dels=0):
+        records = [["chr20", 10000 + i % 50, f"bnd{i}", "N", "N[chr20:50000[", 60, "PASS", "SVTYPE=BND",
+                    "GT", "0/1"] for i in range(self.N_BNDS)]
+        records += [["chr20", 10010 + i, f"del{i}", "N", "<DEL>", 60, "PASS",
+                     f"SVTYPE=DEL;SVLEN=-{100 * (i + 1)};END={10010 + i + 100 * (i + 1)}", "GT", "0/1"]
+                    for i in range(n_dels)]
+        return write_indexed_vcf(sorted(records, key=lambda r: r[1]), ["sample"])
+
+    def test_bnds_kept_in_one_sub_chunk(self):
+        params = truvari.VariantParams()
+        entries = list(truvari.VariantFile(self.make_vcf(n_dels=5), params=params))
+        sub_chunks = [chunk['base'] for chunk, _ in
+                      truvari.collapse.tree_size_chunker(params, [({'base': entries, '__filtered': []}, 1)])]
+        bnd_sub_chunks = [chunk for chunk in sub_chunks if any(entry.is_bnd() for entry in chunk)]
+        self.assertEqual(len(bnd_sub_chunks), 1, "BNDs were split across sub-chunks")
+        self.assertEqual(sum(entry.is_bnd() for entry in bnd_sub_chunks[0]), self.N_BNDS)
+        self.assertEqual(sum(len(chunk) for chunk in sub_chunks), self.N_BNDS + 5, "Variants lost")
+
+    def test_bnds_in_large_chunk_collapsed(self):
+        kept, collapsed = run_collapse(self.make_vcf())
+        self.assertEqual(len(kept), 1, f"Expected 1 kept BND, got {len(kept)}")
+        self.assertEqual(len(collapsed), self.N_BNDS - 1)
+
+
+class TestCollapseGtAddBestMatchesFirst(unittest.TestCase):
+    """
+    With --gt all, a sample can join a cluster with only one call. Sample B has a nested 230 bp DEL
+    and a 360 bp DEL nearly identical to sample A's 352 bp DEL (the cluster's first call). truvari
+    scans smaller variants first, so by default B's 230 bp DEL joins and blocks B's 360 bp DEL;
+    with --gt-add-best-matches-first, B's 360 bp DEL joins instead.
+    """
+
+    def make_vcf(self):
+        return write_indexed_vcf([
+            ["chr20", 100000, "a_del352", "N", "<DEL>", 60, "PASS", "SVTYPE=DEL;SVLEN=-352;END=100352",
+             "GT", "0/1", "./."],
+            ["chr20", 100005, "b_del360", "N", "<DEL>", 60, "PASS", "SVTYPE=DEL;SVLEN=-360;END=100365",
+             "GT", "./.", "0/1"],
+            ["chr20", 100060, "b_del230", "N", "<DEL>", 60, "PASS", "SVTYPE=DEL;SVLEN=-230;END=100290",
+             "GT", "./.", "0/1"],
+        ], ["A", "B"])
+
+    def test_default_adds_first_match_reached(self):
+        kept, collapsed = run_collapse(self.make_vcf(), "--gt", "all", "--pctseq", "0", "--pctsize", "0.5",
+                                       "--pctovl", "0.1")
+        self.assertEqual(collapsed, ["b_del230"])
+        self.assertEqual(sorted(kept), ["a_del352", "b_del360"])
+
+    def test_best_match_first(self):
+        kept, collapsed = run_collapse(self.make_vcf(), "--gt", "all", "--pctseq", "0", "--pctsize", "0.5",
+                                       "--pctovl", "0.1", "--gt-add-best-matches-first")
+        self.assertEqual(collapsed, ["b_del360"])
+        self.assertEqual(sorted(kept), ["a_del352", "b_del230"])
+
+
+class TestDupToInsOverlap(unittest.TestCase):
+    """
+    --dup-to-ins sets a resolved DUP's end to start + 1, so --pctovl must use the DUP's original
+    interval; otherwise overlapping DUPs have no overlap and never collapse.
+    """
+
+    def make_vcf(self):
+        with pysam.FastaFile(TEST_REFERENCE) as fasta:
+            records = []
+            for name, start in (("dup1", 200000), ("dup2", 200100), ("dup3", 201200)):
+                records.append(["chr20", start, name, fasta.fetch("chr20", start - 1, start), "<DUP>", 60,
+                                "PASS", f"SVTYPE=DUP;SVLEN=1000;END={start + 1000}", "GT", "0/1"])
+        return write_indexed_vcf(records, ["sample"])
+
+    def test_recovl_uses_original_interval(self):
+        params = truvari.VariantParams(dup_to_ins=True)
+        with pysam.FastaFile(TEST_REFERENCE) as fasta:
+            dup1, dup2, dup3 = list(truvari.VariantFile(self.make_vcf(), params=params))
+            for entry in (dup1, dup2, dup3):
+                self.assertTrue(entry.resolve(fasta), f"Couldn't resolve {entry}")
+                self.assertEqual(entry.end, entry.start + 1)
+        self.assertAlmostEqual(dup1.recovl(dup2), 0.9, places=3)
+        self.assertEqual(dup1.recovl(dup3), 0)
+
+    def test_overlapping_dups_collapsed(self):
+        kept, collapsed = run_collapse(self.make_vcf(), "-f", TEST_REFERENCE, "--dup-to-ins", "--pctovl", "0.1",
+                                       "--pctseq", "0", "--refdist", "2000")
+        self.assertEqual(collapsed, ["dup2"])
+        self.assertEqual(kept, ["dup1", "dup3"])
 
 
 class FakeVCFI():
